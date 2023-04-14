@@ -1,7 +1,10 @@
 package main
 
-import "fmt"
+import (
+	"github.com/bvisness/yno/cmd"
+	"github.com/bvisness/yno/utils"
+)
 
 func main() {
-	fmt.Println("y no server ??")
+	utils.Must(cmd.RootCmd.Execute())
 }
