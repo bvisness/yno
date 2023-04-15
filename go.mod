@@ -1,6 +1,6 @@
 module github.com/bvisness/yno
 
-go 1.20
+go 1.19
 
 require (
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect

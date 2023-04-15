@@ -84,7 +84,7 @@ func validPort(port string) bool {
 	return true
 }
 
-func getExternalIP() (net.IP, error) {
+func getExternalIPs() ([]net.IP, error) {
 	res, err := http.Get("https://api64.ipify.org")
 	if err != nil {
 		return nil, err
@@ -96,7 +96,37 @@ func getExternalIP() (net.IP, error) {
 		return nil, err
 	}
 
-	return net.ParseIP(string(ipStrBytes)), nil
+	var ips []net.IP
+
+	ip1 := net.ParseIP(string(ipStrBytes))
+	if ip1 == nil {
+		panic(fmt.Errorf("got bad external IP from ipify: %s", string(ipStrBytes)))
+	}
+	ips = append(ips, ip1)
+
+	if ip1.To4() == nil {
+		// Got an IPv6 address. Make another request to force IPv4.
+
+		res, err := http.Get("https://api.ipify.org")
+		if err != nil {
+			return nil, err
+		}
+		defer res.Body.Close()
+
+		ipStrBytes, err := io.ReadAll(res.Body)
+		if err != nil {
+			return nil, err
+		}
+
+		ip2 := net.ParseIP(string(ipStrBytes))
+		if ip2 == nil {
+			panic(fmt.Errorf("got bad external IP from ipify: %s", string(ipStrBytes)))
+		}
+
+		ips = append(ips, ip2)
+	}
+
+	return ips, nil
 }
 
 type Check int
@@ -130,8 +160,8 @@ func runChecks(u *url.URL) Checks {
 
 	isLoopback := net.ParseIP(hostAddrs[0]).IsLoopback()
 	if !isLoopback {
-		fmt.Println("Looking up external IP address via ipify.org...")
-		externalIP, err := getExternalIP()
+		fmt.Println("Looking up external IP addresses via ipify.org...")
+		externalIPs, err := getExternalIPs()
 		if err != nil {
 			fmt.Printf("ERROR: failed to get external IP address: %v\n", err)
 			return res
@@ -139,13 +169,15 @@ func runChecks(u *url.URL) Checks {
 
 		for _, addrString := range hostAddrs {
 			addr := net.ParseIP(addrString)
-			if externalIP.Equal(addr) {
-				res.dnsMatches = CheckSuccess
+			for _, extIP := range externalIPs {
+				if extIP.Equal(addr) {
+					res.dnsMatches = CheckSuccess
+				}
 			}
 		}
 
 		if res.dnsMatches != CheckSuccess {
-			fmt.Printf("POTENTIAL PROBLEM! None of the addresses for %s matched your external IP of %s.\n", u.Hostname(), externalIP)
+			fmt.Printf("POTENTIAL PROBLEM! None of the addresses for %s matched your external IP addresses.\n", u.Hostname())
 			res.dnsMatches = CheckWarn
 		}
 	}
