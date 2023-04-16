@@ -312,7 +312,7 @@ func runChecks(u *url.URL) Report {
 		fmt.Printf("ERROR: could not look up host %s: %v\n", u.Hostname(), err)
 		res.checks = append(res.checks, Check{
 			Status:  CheckFail,
-			Message: fmt.Sprintf("Hostname %s is not valid: %v", u.Hostname(), err),
+			Message: fmt.Sprintf("Hostname %s is not valid", u.Hostname()),
 		})
 		return res
 	}
@@ -469,7 +469,7 @@ func runChecks(u *url.URL) Report {
 		defer httpRes.Body.Close()
 		fmt.Printf("Got HTTP response.\n")
 		if httpRes.StatusCode == http.StatusBadGateway {
-			fmt.Printf("PROBLEM: Got 503 Bad Gateway response.\n")
+			fmt.Printf("PROBLEM: Got 502 Bad Gateway response.\n")
 			res.checks = append(res.checks, Check{
 				Status:  CheckWarn,
 				Message: "HTTP requests / responses are working, but got 503 Bad Gateway response",
