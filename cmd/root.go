@@ -11,9 +11,15 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/bvisness/yno/utils"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
 	"github.com/spf13/cobra"
 )
 
@@ -157,16 +163,16 @@ type Checks struct {
 }
 
 func runChecks(u *url.URL) Checks {
-	var res Checks
+	var checks Checks
 
 	fmt.Printf("Looking up host %s...\n", u.Hostname())
 	hostAddrs, err := net.LookupHost(u.Hostname())
 	if err != nil {
 		fmt.Printf("ERROR: could not look up host %s: %v\n", u.Hostname(), err)
-		res.hostOK = CheckFail
-		return res
+		checks.hostOK = CheckFail
+		return checks
 	}
-	res.hostOK = CheckSuccess
+	checks.hostOK = CheckSuccess
 
 	isLoopback := net.ParseIP(hostAddrs[0]).IsLoopback()
 	if !isLoopback {
@@ -174,21 +180,21 @@ func runChecks(u *url.URL) Checks {
 		externalIPs, err := getExternalIPs()
 		if err != nil {
 			fmt.Printf("ERROR: failed to get external IP address: %v\n", err)
-			return res
+			return checks
 		}
 
 		for _, addrString := range hostAddrs {
 			addr := net.ParseIP(addrString)
 			for _, extIP := range externalIPs {
 				if extIP.Equal(addr) {
-					res.dnsMatches = CheckSuccess
+					checks.dnsMatches = CheckSuccess
 				}
 			}
 		}
 
-		if res.dnsMatches != CheckSuccess {
+		if checks.dnsMatches != CheckSuccess {
 			fmt.Printf("POTENTIAL PROBLEM! None of the addresses for %s matched your external IP addresses.\n", u.Hostname())
-			res.dnsMatches = CheckWarn
+			checks.dnsMatches = CheckWarn
 		}
 	}
 
@@ -202,32 +208,13 @@ func runChecks(u *url.URL) Checks {
 		// yay tcp, continue
 	default:
 		fmt.Printf("I do not understand what %s is because I am a jam project :)\n", u.Scheme)
-		return res
+		return checks
 	}
 
 	if u.Port() == "" {
 		fmt.Println("No port was given; assuming port 80")
 		u.Host = net.JoinHostPort(u.Host, "80")
 	}
-
-	// listeners := checkListeningPorts(u.Port())
-	// if len(listeners) == 0 {
-	// 	fmt.Printf("ERROR: Nobody listening on port %s\n", u.Port())
-	// 	res.anybodyListening = CheckFail
-	// }
-	// res.listeners = listeners
-
-	fmt.Printf("Getting a TCP connection to %s...\n", u.Host)
-	conn, err := net.Dial("tcp", u.Host)
-	if err != nil {
-		fmt.Printf("ERROR: Could not establish TCP connection: %v\n", err)
-		res.tcpWorks = CheckFail
-		return res
-	}
-	defer conn.Close()
-
-	fmt.Println("Got a TCP connection.")
-	res.tcpWorks = CheckSuccess
 
 	var tokenBytes [16]byte
 	rand.Read(tokenBytes[:])
@@ -237,10 +224,58 @@ func runChecks(u *url.URL) Checks {
 	}
 	token := string(tokenBytes[:])
 
-	fmt.Printf("Sending HTTP request with token %s...\n", token)
-	conn.Write([]byte(fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: ynoserver\r\nAccept: */*\r\nX-ynoserver: %s\r\n\r\n", u.Host, token)))
+	packetsChan, handle := getPackets(func(p gopacket.Packet) bool {
+		if tcpLayer := p.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+			tcp, _ := tcpLayer.(*layers.TCP)
+			if strings.Contains(string(tcp.Payload), token) {
+				return true
+			}
+		}
+		return false
+	})
+	defer handle.Close()
 
-	return res
+	var wg sync.WaitGroup
+	var packets []gopacket.Packet
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for packet := range packetsChan {
+			packets = append(packets, packet)
+		}
+	}()
+
+	fmt.Printf("Making HTTP request to %s...\n", u.Host)
+	req, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s/", u.Host), nil)
+	req.Header.Add("X-ynoserver", token)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Printf("ERROR: failed to make HTTP request: %v", err)
+		// TODO: report this as a check
+		return checks
+	}
+	defer res.Body.Close()
+
+	fmt.Printf("Got HTTP response. Checking packets...\n")
+	time.Sleep(time.Millisecond * 100) // TODO: Great jank, should sniff for the HTTP response instead
+	handle.Close()
+	wg.Wait()
+
+	fmt.Printf("Saw %d packets with the token:\n", len(packets))
+	for _, p := range packets {
+		tcp := p.Layer(layers.LayerTypeTCP).(*layers.TCP)
+		srcPortStr := strconv.Itoa(int(tcp.SrcPort))
+		dstPortStr := strconv.Itoa(int(tcp.DstPort))
+
+		listeners := checkListeningPorts(dstPortStr)
+		if len(listeners) == 0 {
+			panic(fmt.Errorf("wat??? no listeners on port %s??", dstPortStr))
+		}
+
+		fmt.Printf("%v -> %v (%s, PID %v)\n", srcPortStr, dstPortStr, listeners[0].Name, listeners[0].PID)
+	}
+
+	return checks
 }
 
 func checko(c Check) string {
@@ -257,11 +292,13 @@ func checko(c Check) string {
 }
 
 var reSSLine = regexp.MustCompile(`LISTEN +\d+ +\d+ +([^ ]+) +[^ ]+( +(.*))?`)
+var reSSPName = regexp.MustCompile(`\(\("([^"]+)"`)
 var reSSPID = regexp.MustCompile(`pid=(\d+)`)
 
 type ListenInfo struct {
 	Host string // host and port
 	PID  string
+	Name string
 }
 
 func checkListeningPorts(port string) []ListenInfo {
@@ -288,10 +325,37 @@ func checkListeningPorts(port string) []ListenInfo {
 		pinfo := m[3]
 		if pinfo != "" {
 			info.PID = reSSPID.FindStringSubmatch(pinfo)[1]
+			info.Name = reSSPName.FindStringSubmatch(pinfo)[1]
 		}
 
 		res = append(res, info)
 	}
 
 	return res
+}
+
+func getPackets(filter func(p gopacket.Packet) bool) (<-chan gopacket.Packet, *pcap.Handle) {
+	c := make(chan gopacket.Packet)
+
+	handle, err := pcap.OpenLive("any", 1600, true, pcap.BlockForever)
+	if err != nil {
+		panic(err)
+	}
+
+	err = handle.SetBPFFilter("tcp and not tcp port 22")
+	if err != nil {
+		panic(err)
+	}
+
+	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+	go func() {
+		defer close(c)
+		for packet := range packetSource.Packets() {
+			if filter(packet) {
+				c <- packet
+			}
+		}
+	}()
+
+	return c, handle
 }
