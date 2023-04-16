@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"fmt"
 	"io"
@@ -38,10 +39,10 @@ func init() {
 			urlStr := args[0]
 
 			u := parse(urlStr)
-			checks := runChecks(u)
+			report := runChecks(u)
 
 			var programs []ListenInfo
-			for _, p := range checks.packets {
+			for _, p := range report.packets {
 				if p.Dst.PID == "" {
 					continue
 				}
@@ -60,7 +61,7 @@ func init() {
 			if len(programs) > 0 {
 				fmt.Println()
 				wordPrograms := "programs"
-				if len(checks.packets) == 1 {
+				if len(report.packets) == 1 {
 					wordPrograms = "program"
 				}
 				fmt.Printf("%d %s handled the incoming traffic:\n", len(programs), wordPrograms)
@@ -75,7 +76,7 @@ func init() {
 
 			var packets []YnoPacket
 			omittedPackets := 0
-			for _, p := range checks.packets {
+			for _, p := range report.packets {
 				flags := getTCPFlags(p.TCP)
 				if string(p.TCP.Payload) == "" && len(flags) == 1 && flags[0] == "ACK" {
 					omittedPackets += 1
@@ -84,9 +85,9 @@ func init() {
 				}
 			}
 
-			if len(checks.packets) > 0 {
+			if len(report.packets) > 0 {
 				fmt.Println()
-				fmt.Printf("%d packets were involved in this check (%d omitted here):\n", len(checks.packets), omittedPackets)
+				fmt.Printf("%d packets were involved in this check (%d omitted here):\n", len(report.packets), omittedPackets)
 				for _, p := range packets {
 					var srcDescParts []string
 					var dstDescParts []string
@@ -111,7 +112,7 @@ func init() {
 						dstDesc = fmt.Sprintf(" (%s)", strings.Join(dstDescParts, ", "))
 					}
 
-					fmt.Printf("- Port %s%s -> Port %s%s", p.Src.Port, srcDesc, p.Dst.Port, dstDesc)
+					fmt.Printf("- %s:%s%s -> %s:%s%s", p.Src.Host, p.Src.Port, srcDesc, p.Dst.Host, p.Dst.Port, dstDesc)
 					if string(p.TCP.Payload) != "" {
 						fmt.Println()
 						fmt.Print(string(p.TCP.Payload))
@@ -128,21 +129,24 @@ func init() {
 
 			fmt.Println()
 			fmt.Println("Final report:")
-			printCheck(checks.hostOK, "Hostname \"%s\" is valid and can be resolved by DNS", u.Hostname())
-			printCheck(checks.dnsMatches, "DNS records for %s lead to this server", u.Hostname())
-			printCheck(checks.listening, "Server is listening on port %s", u.Port())
-			httpMessage := "HTTP requests / responses are working"
-			if checks.httpMessage != "" {
-				httpMessage += " (" + checks.httpMessage + ")"
+			for _, check := range report.checks {
+				printCheck(check)
 			}
-			printCheck(checks.httpSuccess, httpMessage)
 		},
 	}
 }
 
-func printCheck(check Check, msg string, a ...any) {
+func checkTernary(check CheckStatus, ifOk, ifFail string) string {
+	if check == CheckFail {
+		return ifFail
+	} else {
+		return ifOk
+	}
+}
+
+func printCheck(check Check) {
 	var emoji string
-	switch check {
+	switch check.Status {
 	case CheckSuccess:
 		emoji = "✅"
 	case CheckFail:
@@ -153,8 +157,10 @@ func printCheck(check Check, msg string, a ...any) {
 		return
 	}
 
-	args := []any{emoji}
-	fmt.Printf("%s "+msg+"\n", append(args, a...)...)
+	fmt.Printf("%s %s\n", emoji, check.Message)
+	for _, detail := range check.Details {
+		fmt.Printf("   - %s\n", detail)
+	}
 }
 
 func getTCPFlags(p *layers.TCP) (flags []string) {
@@ -277,37 +283,44 @@ func getExternalIPs() ([]net.IP, error) {
 	return ips, nil
 }
 
-type Check int
+type CheckStatus int
 
 const (
-	CheckUnknown Check = iota
+	CheckUnknown CheckStatus = iota
 	CheckSuccess
 	CheckFail
 	CheckWarn
 )
 
-type Checks struct {
-	hostOK      Check
-	dnsMatches  Check
-	listening   Check
-	httpSuccess Check
-
-	packets     []YnoPacket
-	httpMessage string
+type Check struct {
+	Status  CheckStatus
+	Message string
+	Details []string
 }
 
-func runChecks(u *url.URL) Checks {
-	var checks Checks
+type Report struct {
+	checks  []Check
+	packets []YnoPacket
+}
+
+func runChecks(u *url.URL) Report {
+	var res Report
 
 	fmt.Printf("Looking up host %s...\n", u.Hostname())
 	hostAddrs, err := net.LookupHost(u.Hostname())
 	if err != nil {
 		fmt.Printf("ERROR: could not look up host %s: %v\n", u.Hostname(), err)
-		checks.hostOK = CheckFail
-		return checks
+		res.checks = append(res.checks, Check{
+			Status:  CheckFail,
+			Message: fmt.Sprintf("Hostname %s is not valid: %v", u.Hostname(), err),
+		})
+		return res
 	}
+	res.checks = append(res.checks, Check{
+		Status:  CheckSuccess,
+		Message: fmt.Sprintf("Hostname \"%s\" is valid and can be resolved by DNS", u.Hostname()),
+	})
 	fmt.Printf("Host is valid.\n")
-	checks.hostOK = CheckSuccess
 
 	isLoopback := net.ParseIP(hostAddrs[0]).IsLoopback()
 	if !isLoopback {
@@ -315,21 +328,29 @@ func runChecks(u *url.URL) Checks {
 		externalIPs, err := getExternalIPs()
 		if err != nil {
 			fmt.Printf("ERROR: failed to get external IP address: %v\n", err)
-			return checks
+			return res
 		}
 
+		dnsMatches := false
 		for _, addrString := range hostAddrs {
 			addr := net.ParseIP(addrString)
 			for _, extIP := range externalIPs {
 				if extIP.Equal(addr) {
-					checks.dnsMatches = CheckSuccess
+					dnsMatches = true
+					res.checks = append(res.checks, Check{
+						Status:  CheckSuccess,
+						Message: fmt.Sprintf("DNS records for %s lead to this server", u.Hostname()),
+					})
 				}
 			}
 		}
 
-		if checks.dnsMatches != CheckSuccess {
+		if !dnsMatches {
 			fmt.Printf("POTENTIAL PROBLEM! None of the addresses for %s matched your external IP addresses.\n", u.Hostname())
-			checks.dnsMatches = CheckWarn
+			res.checks = append(res.checks, Check{
+				Status:  CheckWarn,
+				Message: fmt.Sprintf("DNS records for %s do not lead to this server", u.Hostname()),
+			})
 		}
 	}
 
@@ -343,7 +364,7 @@ func runChecks(u *url.URL) Checks {
 		// yay http, continue
 	default:
 		fmt.Printf("I do not understand what %s is because I am a jam project :)\n", u.Scheme)
-		return checks
+		return res
 	}
 
 	if u.Port() == "" {
@@ -351,20 +372,44 @@ func runChecks(u *url.URL) Checks {
 		u.Host = net.JoinHostPort(u.Host, "80")
 	}
 
-	listeners := checkListeningPorts(u.Port())
-	if len(listeners) > 0 {
-		checks.listening = CheckSuccess
+	var listeningStatus CheckStatus
+	var listeningMessage string
+
+	isListening := len(checkListeningPorts(u.Port())) > 0
+	if isListening {
+		listeningStatus = CheckSuccess
+		listeningMessage = fmt.Sprintf("Server is listening on port %s", u.Port())
 	} else {
 		fmt.Printf("PROBLEM: Nothing is listening on port %s.\n", u.Port())
-		checks.listening = CheckFail
+		listeningStatus = CheckFail
+		listeningMessage = fmt.Sprintf("Server is not listening on port %s", u.Port())
 	}
 
-	// TODO: If checking port 80, and nothing is listening, also check 443
+	alsoCheck := ""
+	if u.Port() == "80" {
+		alsoCheck = "443"
+	} else if u.Port() == "443" {
+		alsoCheck = "80"
+	}
+	if alsoCheck != "" {
+		if len(checkListeningPorts(alsoCheck)) > 0 {
+			if !isListening {
+				listeningMessage += fmt.Sprintf(" (but it is listening on port %s)", alsoCheck)
+			} else {
+				listeningMessage += fmt.Sprintf(" (and port %s)", alsoCheck)
+			}
+		}
+	}
+
+	res.checks = append(res.checks, Check{
+		Status:  listeningStatus,
+		Message: listeningMessage,
+	})
 
 	var tokenBytes [16]byte
 	rand.Read(tokenBytes[:])
 	for i, b := range tokenBytes {
-		const alphabet = "bcdfghjklmnpqrstvwxyzBCDFGHJKLMNPQRSTVWXYZ0123456789"
+		const alphabet = "bcdfghjklmnpqrstvwxyzBCDFGHJKLMNPQRSTVWXYZ2456789"
 		tokenBytes[i] = alphabet[int(b)%len(alphabet)]
 	}
 	token := string(tokenBytes[:])
@@ -400,25 +445,45 @@ func runChecks(u *url.URL) Checks {
 	}()
 
 	fmt.Printf("Making HTTP request to %s...\n", u.Host)
-	req, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s/", u.Host), nil)
-	req.Header.Add("X-ynoserver", token)
+	httpReq, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s/", u.Host), nil)
+	httpReq.Header.Add("X-ynoserver", token)
 	client := http.Client{
 		Timeout: time.Second * 5,
+		// See https://stackoverflow.com/questions/49384786/how-to-capture-ip-address-of-server-providing-http-response
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				conn, err := net.Dial(network, addr)
+				httpReq.RemoteAddr = conn.RemoteAddr().String()
+				return conn, err
+			},
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			httpReq = req
+			return nil
+		},
 	}
-	res, err := client.Do(req)
+	httpRes, err := client.Do(httpReq)
 	if err == nil {
-		defer res.Body.Close()
+		defer httpRes.Body.Close()
 		fmt.Printf("Got HTTP response.\n")
-		if res.StatusCode == http.StatusBadGateway {
+		if httpRes.StatusCode == http.StatusBadGateway {
 			fmt.Printf("PROBLEM: Got 503 Bad Gateway response.\n")
-			checks.httpSuccess = CheckWarn
-			checks.httpMessage = "but got 503 Bad Gateway response"
+			res.checks = append(res.checks, Check{
+				Status:  CheckWarn,
+				Message: "HTTP requests / responses are working, but got 503 Bad Gateway response",
+			})
 		} else {
-			checks.httpSuccess = CheckSuccess
+			res.checks = append(res.checks, Check{
+				Status:  CheckSuccess,
+				Message: "HTTP requests / responses are working",
+			})
 		}
 	} else {
 		fmt.Printf("ERROR: HTTP request failed: %v\n", err)
-		checks.httpSuccess = CheckFail
+		res.checks = append(res.checks, Check{
+			Status:  CheckFail,
+			Message: "HTTP requests / responses are not working",
+		})
 	}
 
 	fmt.Printf("Checking packets...\n")
@@ -443,21 +508,45 @@ func runChecks(u *url.URL) Checks {
 		}
 	}
 
-	// fmt.Printf("Saw %d packets with the token:\n", len(packets))
 	for _, p := range packets {
 		tcp := p.Layer(layers.LayerTypeTCP).(*layers.TCP)
 		srcPortStr := strconv.Itoa(int(tcp.SrcPort))
 		dstPortStr := strconv.Itoa(int(tcp.DstPort))
 
-		// fmt.Printf("%v -> %v (%s, PID %v)\n", srcPortStr, dstPortStr, listeners[0].Name, listeners[0].PID)
-		checks.packets = append(checks.packets, YnoPacket{
+		res.packets = append(res.packets, YnoPacket{
 			TCP: tcp,
 			Src: getListener(srcPortStr),
 			Dst: getListener(dstPortStr),
 		})
 	}
 
-	return checks
+	if len(packets) > 0 {
+		res.checks = append(res.checks, Check{
+			Status:  CheckSuccess,
+			Message: "Request arrived at this server",
+		})
+	} else {
+		check := Check{
+			Status:  CheckFail,
+			Message: "Request never arrived at this server (who are you talking to?)",
+		}
+
+		check.Details = append(check.Details, fmt.Sprintf("Request went to %s", httpReq.RemoteAddr))
+		// TODO: In theory we should be able to read the source IP address from the response's TCP packets, but golang's HTTP client doesn't want to let us >:(
+		// (I realize it could be spoofed or whatever, but the goal is to help people find problems, ok?)
+
+		if len(hostAddrs) > 0 {
+			var hostAddrMessage string
+			for _, addr := range hostAddrs {
+				hostAddrMessage += fmt.Sprintf("\n     - %s", addr)
+			}
+			check.Details = append(check.Details, fmt.Sprintf("%s resolved to these IP addresses:%s", u.Hostname(), hostAddrMessage))
+		}
+
+		res.checks = append(res.checks, check)
+	}
+
+	return res
 }
 
 var reSSLine = regexp.MustCompile(`LISTEN +\d+ +\d+ +([^ ]+) +[^ ]+( +(.*))?`)
@@ -517,7 +606,7 @@ func getPackets(filter func(p gopacket.Packet) bool) (<-chan gopacket.Packet, *p
 		panic(err)
 	}
 
-	err = handle.SetBPFFilter("tcp")
+	err = handle.SetBPFFilter("tcp and not outbound")
 	if err != nil {
 		panic(err)
 	}
