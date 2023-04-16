@@ -42,10 +42,14 @@ func init() {
 
 			fmt.Println()
 			fmt.Println("Final report:")
-			printCheck(checks.hostOK, "Hostname of %s is valid and can be resolved by DNS", u.Hostname())
+			printCheck(checks.hostOK, "Hostname \"%s\" is valid and can be resolved by DNS", u.Hostname())
 			printCheck(checks.dnsMatches, "DNS records for %s lead to this server", u.Hostname())
 			printCheck(checks.listening, "Server is listening on port %s", u.Port())
-			printCheck(checks.httpSuccess, "HTTP requests / responses are working")
+			httpMessage := "HTTP requests / responses are working"
+			if checks.httpMessage != "" {
+				httpMessage += " (" + checks.httpMessage + ")"
+			}
+			printCheck(checks.httpSuccess, httpMessage)
 			if len(checks.listeners) > 0 {
 				fmt.Println()
 				programs := "programs"
@@ -189,7 +193,8 @@ type Checks struct {
 	listening   Check
 	httpSuccess Check
 
-	listeners []ListenInfo
+	listeners   []ListenInfo
+	httpMessage string
 }
 
 func runChecks(u *url.URL) Checks {
@@ -251,7 +256,7 @@ func runChecks(u *url.URL) Checks {
 	if len(listeners) > 0 {
 		checks.listening = CheckSuccess
 	} else {
-		fmt.Printf("LIKELY PROBLEM: Nothing is listening on port %s.\n", u.Port())
+		fmt.Printf("PROBLEM: Nothing is listening on port %s.\n", u.Port())
 		checks.listening = CheckFail
 	}
 
@@ -287,13 +292,22 @@ func runChecks(u *url.URL) Checks {
 	fmt.Printf("Making HTTP request to %s...\n", u.Host)
 	req, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s/", u.Host), nil)
 	req.Header.Add("X-ynoserver", token)
-	res, err := http.DefaultClient.Do(req)
+	client := http.Client{
+		Timeout: time.Second * 5,
+	}
+	res, err := client.Do(req)
 	if err == nil {
 		defer res.Body.Close()
 		fmt.Printf("Got HTTP response.\n")
-		checks.httpSuccess = CheckSuccess
+		if res.StatusCode == http.StatusBadGateway {
+			fmt.Printf("PROBLEM: Got 503 Bad Gateway response.\n")
+			checks.httpSuccess = CheckWarn
+			checks.httpMessage = "but got 503 Bad Gateway response"
+		} else {
+			checks.httpSuccess = CheckSuccess
+		}
 	} else {
-		fmt.Printf("ERROR: HTTP request failed: %v", err)
+		fmt.Printf("ERROR: HTTP request failed: %v\n", err)
 		checks.httpSuccess = CheckFail
 	}
 
