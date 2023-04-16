@@ -1,13 +1,18 @@
 package cmd
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"regexp"
+	"strings"
 
+	"github.com/bvisness/yno/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -32,6 +37,7 @@ func init() {
 			fmt.Println("Final report:")
 			fmt.Printf("%s Hostname of %s is valid and can be resolved by DNS\n", checko(checks.hostOK), u.Hostname())
 			fmt.Printf("%s DNS records for %s lead to this server\n", checko(checks.dnsMatches), u.Hostname())
+			fmt.Printf("%s Server is listening on port %s\n", checko(checks.tcpWorks), u.Port())
 			fmt.Printf("%s TCP connections can be established on port %s\n", checko(checks.tcpWorks), u.Port())
 		},
 	}
@@ -139,11 +145,14 @@ const (
 )
 
 type Checks struct {
-	hostOK     Check
-	dnsMatches Check
-	tcpWorks   Check
-	udpWorks   Check
-	icmpWorks  Check
+	hostOK           Check
+	dnsMatches       Check
+	anybodyListening Check
+	tcpWorks         Check
+	udpWorks         Check
+	icmpWorks        Check
+
+	listeners []ListenInfo
 }
 
 func runChecks(u *url.URL) Checks {
@@ -200,6 +209,13 @@ func runChecks(u *url.URL) Checks {
 		u.Host = net.JoinHostPort(u.Host, "80")
 	}
 
+	listeners := checkListeningPorts(u.Port())
+	if len(listeners) == 0 {
+		fmt.Printf("ERROR: Nobody listening on port %s\n", u.Port())
+		res.anybodyListening = CheckFail
+	}
+	res.listeners = listeners
+
 	fmt.Printf("Getting a TCP connection to %s...\n", u.Host)
 	conn, err := net.Dial("tcp", u.Host)
 	if err != nil {
@@ -226,4 +242,44 @@ func checko(c Check) string {
 	default:
 		return "❓"
 	}
+}
+
+var reSSLine = regexp.MustCompile(`LISTEN +\d+ +\d+ +([^ ]+) +[^ ]+( +(.*))?`)
+var reSSPID = regexp.MustCompile(`pid=(\d+)`)
+
+type ListenInfo struct {
+	Host string // host and port
+	PID  string
+}
+
+func checkListeningPorts(port string) []ListenInfo {
+	cmd := exec.Command("ss", "-tnlHOp", fmt.Sprintf("( sport = :%s )", port))
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	utils.Must(cmd.Run())
+
+	var res []ListenInfo
+
+	lines := strings.Split(buf.String(), "\n")
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		var info ListenInfo
+
+		m := reSSLine.FindStringSubmatch(line)
+		if m == nil {
+			panic(fmt.Errorf("ss line didn't match the regex: %s", line))
+		}
+		info.Host = m[1]
+		pinfo := m[3]
+		if pinfo != "" {
+			info.PID = reSSPID.FindStringSubmatch(pinfo)[1]
+		}
+
+		res = append(res, info)
+	}
+
+	return res
 }
