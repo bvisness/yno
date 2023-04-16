@@ -42,12 +42,44 @@ func init() {
 
 			fmt.Println()
 			fmt.Println("Final report:")
-			fmt.Printf("%s Hostname of %s is valid and can be resolved by DNS\n", checko(checks.hostOK), u.Hostname())
-			fmt.Printf("%s DNS records for %s lead to this server\n", checko(checks.dnsMatches), u.Hostname())
-			fmt.Printf("%s Server is listening on port %s\n", checko(checks.tcpWorks), u.Port())
-			fmt.Printf("%s TCP connections can be established on port %s\n", checko(checks.tcpWorks), u.Port())
+			printCheck(checks.hostOK, "Hostname of %s is valid and can be resolved by DNS", u.Hostname())
+			printCheck(checks.dnsMatches, "DNS records for %s lead to this server", u.Hostname())
+			printCheck(checks.listening, "Server is listening on port %s", u.Port())
+			printCheck(checks.httpSuccess, "HTTP requests / responses are working")
+			if len(checks.listeners) > 0 {
+				fmt.Println()
+				programs := "programs"
+				if len(checks.listeners) == 1 {
+					programs = "program"
+				}
+				fmt.Printf("%d %s handled the incoming traffic:\n", len(checks.listeners), programs)
+				for _, listener := range checks.listeners {
+					desc := fmt.Sprintf("PID %s (port %s)", listener.PID, listener.Port)
+					if listener.Name != "" {
+						desc = fmt.Sprintf("%s (PID %s, port %s)", listener.Name, listener.PID, listener.Port)
+					}
+					fmt.Printf("- %s\n", desc)
+				}
+			}
 		},
 	}
+}
+
+func printCheck(check Check, msg string, a ...any) {
+	var emoji string
+	switch check {
+	case CheckSuccess:
+		emoji = "✅"
+	case CheckFail:
+		emoji = "❌"
+	case CheckWarn:
+		emoji = "⚠️"
+	default:
+		return
+	}
+
+	args := []any{emoji}
+	fmt.Printf("%s "+msg+"\n", append(args, a...)...)
 }
 
 func parse(urlStr string) *url.URL {
@@ -152,12 +184,10 @@ const (
 )
 
 type Checks struct {
-	hostOK           Check
-	dnsMatches       Check
-	anybodyListening Check
-	tcpWorks         Check
-	udpWorks         Check
-	icmpWorks        Check
+	hostOK      Check
+	dnsMatches  Check
+	listening   Check
+	httpSuccess Check
 
 	listeners []ListenInfo
 }
@@ -172,6 +202,7 @@ func runChecks(u *url.URL) Checks {
 		checks.hostOK = CheckFail
 		return checks
 	}
+	fmt.Printf("Host is valid.\n")
 	checks.hostOK = CheckSuccess
 
 	isLoopback := net.ParseIP(hostAddrs[0]).IsLoopback()
@@ -199,13 +230,13 @@ func runChecks(u *url.URL) Checks {
 	}
 
 	if u.Scheme == "" {
-		fmt.Println("No protocol was given; assuming TCP")
-		u.Scheme = "tcp"
+		fmt.Println("No protocol was given; assuming HTTP")
+		u.Scheme = "http"
 	}
 
 	switch u.Scheme {
-	case "tcp", "http", "https":
-		// yay tcp, continue
+	case "http":
+		// yay http, continue
 	default:
 		fmt.Printf("I do not understand what %s is because I am a jam project :)\n", u.Scheme)
 		return checks
@@ -214,6 +245,14 @@ func runChecks(u *url.URL) Checks {
 	if u.Port() == "" {
 		fmt.Println("No port was given; assuming port 80")
 		u.Host = net.JoinHostPort(u.Host, "80")
+	}
+
+	listeners := checkListeningPorts(u.Port())
+	if len(listeners) > 0 {
+		checks.listening = CheckSuccess
+	} else {
+		fmt.Printf("LIKELY PROBLEM: Nothing is listening on port %s.\n", u.Port())
+		checks.listening = CheckFail
 	}
 
 	var tokenBytes [16]byte
@@ -249,22 +288,24 @@ func runChecks(u *url.URL) Checks {
 	req, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s/", u.Host), nil)
 	req.Header.Add("X-ynoserver", token)
 	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		fmt.Printf("ERROR: failed to make HTTP request: %v", err)
-		// TODO: report this as a check
-		return checks
+	if err == nil {
+		defer res.Body.Close()
+		fmt.Printf("Got HTTP response.\n")
+		checks.httpSuccess = CheckSuccess
+	} else {
+		fmt.Printf("ERROR: HTTP request failed: %v", err)
+		checks.httpSuccess = CheckFail
 	}
-	defer res.Body.Close()
 
-	fmt.Printf("Got HTTP response. Checking packets...\n")
+	fmt.Printf("Checking packets...\n")
 	time.Sleep(time.Millisecond * 100) // TODO: Great jank, should sniff for the HTTP response instead
 	handle.Close()
 	wg.Wait()
 
-	fmt.Printf("Saw %d packets with the token:\n", len(packets))
+	// fmt.Printf("Saw %d packets with the token:\n", len(packets))
 	for _, p := range packets {
 		tcp := p.Layer(layers.LayerTypeTCP).(*layers.TCP)
-		srcPortStr := strconv.Itoa(int(tcp.SrcPort))
+		// srcPortStr := strconv.Itoa(int(tcp.SrcPort))
 		dstPortStr := strconv.Itoa(int(tcp.DstPort))
 
 		listeners := checkListeningPorts(dstPortStr)
@@ -272,23 +313,11 @@ func runChecks(u *url.URL) Checks {
 			panic(fmt.Errorf("wat??? no listeners on port %s??", dstPortStr))
 		}
 
-		fmt.Printf("%v -> %v (%s, PID %v)\n", srcPortStr, dstPortStr, listeners[0].Name, listeners[0].PID)
+		// fmt.Printf("%v -> %v (%s, PID %v)\n", srcPortStr, dstPortStr, listeners[0].Name, listeners[0].PID)
+		checks.listeners = append(checks.listeners, listeners[0])
 	}
 
 	return checks
-}
-
-func checko(c Check) string {
-	switch c {
-	case CheckSuccess:
-		return "✅"
-	case CheckFail:
-		return "❌"
-	case CheckWarn:
-		return "⚠️"
-	default:
-		return "❓"
-	}
 }
 
 var reSSLine = regexp.MustCompile(`LISTEN +\d+ +\d+ +([^ ]+) +[^ ]+( +(.*))?`)
@@ -296,7 +325,8 @@ var reSSPName = regexp.MustCompile(`\(\("([^"]+)"`)
 var reSSPID = regexp.MustCompile(`pid=(\d+)`)
 
 type ListenInfo struct {
-	Host string // host and port
+	Host string
+	Port string
 	PID  string
 	Name string
 }
@@ -321,7 +351,7 @@ func checkListeningPorts(port string) []ListenInfo {
 		if m == nil {
 			panic(fmt.Errorf("ss line didn't match the regex: %s", line))
 		}
-		info.Host = m[1]
+		info.Host, info.Port, _ = net.SplitHostPort(m[1])
 		pinfo := m[3]
 		if pinfo != "" {
 			info.PID = reSSPID.FindStringSubmatch(pinfo)[1]
