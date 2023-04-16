@@ -40,6 +40,92 @@ func init() {
 			u := parse(urlStr)
 			checks := runChecks(u)
 
+			var programs []ListenInfo
+			for _, p := range checks.packets {
+				if p.Dst.PID == "" {
+					continue
+				}
+
+				alreadyThere := false
+				for _, prog := range programs {
+					if prog.PID == p.Dst.PID {
+						alreadyThere = true
+					}
+				}
+				if !alreadyThere {
+					programs = append(programs, p.Dst)
+				}
+			}
+
+			if len(programs) > 0 {
+				fmt.Println()
+				wordPrograms := "programs"
+				if len(checks.packets) == 1 {
+					wordPrograms = "program"
+				}
+				fmt.Printf("%d %s handled the incoming traffic:\n", len(programs), wordPrograms)
+				for _, prog := range programs {
+					desc := fmt.Sprintf("PID %s (port %s)", prog.PID, prog.Port)
+					if prog.Name != "" {
+						desc = fmt.Sprintf("%s (PID %s, port %s)", prog.Name, prog.PID, prog.Port)
+					}
+					fmt.Printf("- %s\n", desc)
+				}
+			}
+
+			var packets []YnoPacket
+			omittedPackets := 0
+			for _, p := range checks.packets {
+				flags := getTCPFlags(p.TCP)
+				if string(p.TCP.Payload) == "" && len(flags) == 1 && flags[0] == "ACK" {
+					omittedPackets += 1
+				} else {
+					packets = append(packets, p)
+				}
+			}
+
+			if len(checks.packets) > 0 {
+				fmt.Println()
+				fmt.Printf("%d packets were involved in this check (%d omitted here):\n", len(checks.packets), omittedPackets)
+				for _, p := range packets {
+					var srcDescParts []string
+					var dstDescParts []string
+					if p.Src.Name != "" {
+						srcDescParts = append(srcDescParts, p.Src.Name)
+					}
+					if p.Src.PID != "" {
+						srcDescParts = append(srcDescParts, fmt.Sprintf("PID %s", p.Src.PID))
+					}
+					if p.Dst.Name != "" {
+						dstDescParts = append(dstDescParts, p.Dst.Name)
+					}
+					if p.Dst.PID != "" {
+						dstDescParts = append(dstDescParts, fmt.Sprintf("PID %s", p.Dst.PID))
+					}
+
+					var srcDesc, dstDesc string
+					if len(srcDescParts) > 0 {
+						srcDesc = fmt.Sprintf(" (%s)", strings.Join(srcDescParts, ", "))
+					}
+					if len(dstDescParts) > 0 {
+						dstDesc = fmt.Sprintf(" (%s)", strings.Join(dstDescParts, ", "))
+					}
+
+					fmt.Printf("- Port %s%s -> Port %s%s", p.Src.Port, srcDesc, p.Dst.Port, dstDesc)
+					if string(p.TCP.Payload) != "" {
+						fmt.Println()
+						fmt.Print(string(p.TCP.Payload))
+						if p.TCP.Payload[len(p.TCP.Payload)-1] != '\n' {
+							fmt.Println()
+						}
+					} else if flags := getTCPFlags(p.TCP); len(flags) > 0 {
+						fmt.Printf(" (TCP %s)\n", strings.Join(flags, ", "))
+					} else {
+						fmt.Printf(" (empty packet)\n")
+					}
+				}
+			}
+
 			fmt.Println()
 			fmt.Println("Final report:")
 			printCheck(checks.hostOK, "Hostname \"%s\" is valid and can be resolved by DNS", u.Hostname())
@@ -50,21 +136,6 @@ func init() {
 				httpMessage += " (" + checks.httpMessage + ")"
 			}
 			printCheck(checks.httpSuccess, httpMessage)
-			if len(checks.listeners) > 0 {
-				fmt.Println()
-				programs := "programs"
-				if len(checks.listeners) == 1 {
-					programs = "program"
-				}
-				fmt.Printf("%d %s handled the incoming traffic:\n", len(checks.listeners), programs)
-				for _, listener := range checks.listeners {
-					desc := fmt.Sprintf("PID %s (port %s)", listener.PID, listener.Port)
-					if listener.Name != "" {
-						desc = fmt.Sprintf("%s (PID %s, port %s)", listener.Name, listener.PID, listener.Port)
-					}
-					fmt.Printf("- %s\n", desc)
-				}
-			}
 		},
 	}
 }
@@ -84,6 +155,34 @@ func printCheck(check Check, msg string, a ...any) {
 
 	args := []any{emoji}
 	fmt.Printf("%s "+msg+"\n", append(args, a...)...)
+}
+
+func getTCPFlags(p *layers.TCP) (flags []string) {
+	if p.CWR {
+		flags = append(flags, "CWR")
+	}
+	if p.ECE {
+		flags = append(flags, "ECE")
+	}
+	if p.URG {
+		flags = append(flags, "URG")
+	}
+	if p.ACK {
+		flags = append(flags, "ACK")
+	}
+	if p.PSH {
+		flags = append(flags, "PSH")
+	}
+	if p.RST {
+		flags = append(flags, "RST")
+	}
+	if p.SYN {
+		flags = append(flags, "SYN")
+	}
+	if p.FIN {
+		flags = append(flags, "FIN")
+	}
+	return
 }
 
 func parse(urlStr string) *url.URL {
@@ -193,7 +292,7 @@ type Checks struct {
 	listening   Check
 	httpSuccess Check
 
-	listeners   []ListenInfo
+	packets     []YnoPacket
 	httpMessage string
 }
 
@@ -260,6 +359,8 @@ func runChecks(u *url.URL) Checks {
 		checks.listening = CheckFail
 	}
 
+	// TODO: If checking port 80, and nothing is listening, also check 443
+
 	var tokenBytes [16]byte
 	rand.Read(tokenBytes[:])
 	for i, b := range tokenBytes {
@@ -268,11 +369,20 @@ func runChecks(u *url.URL) Checks {
 	}
 	token := string(tokenBytes[:])
 
+	var sourcePorts []layers.TCPPort
 	packetsChan, handle := getPackets(func(p gopacket.Packet) bool {
 		if tcpLayer := p.Layer(layers.LayerTypeTCP); tcpLayer != nil {
 			tcp, _ := tcpLayer.(*layers.TCP)
+			// Track any packets that have our random token
 			if strings.Contains(string(tcp.Payload), token) {
+				sourcePorts = append(sourcePorts, tcp.SrcPort)
 				return true
+			}
+			// Track any packets that are replying after receiving the token
+			for _, srcPort := range sourcePorts {
+				if srcPort == tcp.DstPort {
+					return true
+				}
 			}
 		}
 		return false
@@ -316,19 +426,35 @@ func runChecks(u *url.URL) Checks {
 	handle.Close()
 	wg.Wait()
 
+	port2listener := make(map[string]ListenInfo)
+	getListener := func(port string) ListenInfo {
+		if l, ok := port2listener[port]; ok {
+			return l
+		} else {
+			listeners := checkListeningPorts(port)
+			if len(listeners) == 0 {
+				port2listener[port] = ListenInfo{
+					Port: port,
+				}
+			} else {
+				port2listener[port] = listeners[0]
+			}
+			return port2listener[port]
+		}
+	}
+
 	// fmt.Printf("Saw %d packets with the token:\n", len(packets))
 	for _, p := range packets {
 		tcp := p.Layer(layers.LayerTypeTCP).(*layers.TCP)
-		// srcPortStr := strconv.Itoa(int(tcp.SrcPort))
+		srcPortStr := strconv.Itoa(int(tcp.SrcPort))
 		dstPortStr := strconv.Itoa(int(tcp.DstPort))
 
-		listeners := checkListeningPorts(dstPortStr)
-		if len(listeners) == 0 {
-			panic(fmt.Errorf("wat??? no listeners on port %s??", dstPortStr))
-		}
-
 		// fmt.Printf("%v -> %v (%s, PID %v)\n", srcPortStr, dstPortStr, listeners[0].Name, listeners[0].PID)
-		checks.listeners = append(checks.listeners, listeners[0])
+		checks.packets = append(checks.packets, YnoPacket{
+			TCP: tcp,
+			Src: getListener(srcPortStr),
+			Dst: getListener(dstPortStr),
+		})
 	}
 
 	return checks
@@ -343,6 +469,11 @@ type ListenInfo struct {
 	Port string
 	PID  string
 	Name string
+}
+
+type YnoPacket struct {
+	TCP      *layers.TCP
+	Src, Dst ListenInfo
 }
 
 func checkListeningPorts(port string) []ListenInfo {
@@ -386,7 +517,7 @@ func getPackets(filter func(p gopacket.Packet) bool) (<-chan gopacket.Packet, *p
 		panic(err)
 	}
 
-	err = handle.SetBPFFilter("tcp and not tcp port 22")
+	err = handle.SetBPFFilter("tcp")
 	if err != nil {
 		panic(err)
 	}
