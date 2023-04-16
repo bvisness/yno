@@ -24,17 +24,21 @@ sudo apt install libpcap-dev
 Then, if you have a sufficiently recent version of [Go](https://go.dev/), you can install it from source:
 
 ```
-go install github.com/bvisness/yno
+go install github.com/bvisness/yno@latest
 ```
+
+Make sure `$(go env GOPATH)/bin` is on your `PATH`.
 
 `yno` has only been tested on Ubuntu 22.04.
 
 ## Running
 
 ```
-yno localhost:8080
-yno mywebsite.com
+sudo yno localhost:8080
+sudo yno mywebsite.com
 ```
+
+Because `yno` needs to trace packets, it must be run as root.
 
 ## Jam Info
 
