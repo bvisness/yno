@@ -323,9 +323,10 @@ func runChecks(u *url.URL) Report {
 	fmt.Printf("Host is valid.\n")
 
 	isLoopback := net.ParseIP(hostAddrs[0]).IsLoopback()
+	var externalIPs []net.IP
 	if !isLoopback {
 		fmt.Println("Looking up external IP addresses via ipify.org...")
-		externalIPs, err := getExternalIPs()
+		externalIPs, err = getExternalIPs()
 		if err != nil {
 			fmt.Printf("ERROR: failed to get external IP address: %v\n", err)
 			return res
@@ -544,6 +545,13 @@ func runChecks(u *url.URL) Report {
 					hostAddrMessage += fmt.Sprintf("\n     - %s", addr)
 				}
 				check.Details = append(check.Details, fmt.Sprintf("%s resolved to these IP addresses:%s", u.Hostname(), hostAddrMessage))
+			}
+			if len(externalIPs) > 0 {
+				var extIPMessage string
+				for _, ip := range externalIPs {
+					extIPMessage += fmt.Sprintf("\n     - %s", ip)
+				}
+				check.Details = append(check.Details, fmt.Sprintf("This server's external IP addresses:%s", extIPMessage))
 			}
 
 			res.checks = append(res.checks, check)
