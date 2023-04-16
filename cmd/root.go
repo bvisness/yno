@@ -453,7 +453,9 @@ func runChecks(u *url.URL) Report {
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				conn, err := net.Dial(network, addr)
-				httpReq.RemoteAddr = conn.RemoteAddr().String()
+				if err == nil {
+					httpReq.RemoteAddr = conn.RemoteAddr().String()
+				}
 				return conn, err
 			},
 		},
@@ -520,30 +522,32 @@ func runChecks(u *url.URL) Report {
 		})
 	}
 
-	if len(packets) > 0 {
-		res.checks = append(res.checks, Check{
-			Status:  CheckSuccess,
-			Message: "Request arrived at this server",
-		})
-	} else {
-		check := Check{
-			Status:  CheckFail,
-			Message: "Request never arrived at this server (who are you talking to?)",
-		}
-
-		check.Details = append(check.Details, fmt.Sprintf("Request went to %s", httpReq.RemoteAddr))
-		// TODO: In theory we should be able to read the source IP address from the response's TCP packets, but golang's HTTP client doesn't want to let us >:(
-		// (I realize it could be spoofed or whatever, but the goal is to help people find problems, ok?)
-
-		if len(hostAddrs) > 0 {
-			var hostAddrMessage string
-			for _, addr := range hostAddrs {
-				hostAddrMessage += fmt.Sprintf("\n     - %s", addr)
+	if httpRes != nil {
+		if len(packets) > 0 {
+			res.checks = append(res.checks, Check{
+				Status:  CheckSuccess,
+				Message: "Request arrived at this server",
+			})
+		} else {
+			check := Check{
+				Status:  CheckFail,
+				Message: "Request never arrived at this server (who are you talking to?)",
 			}
-			check.Details = append(check.Details, fmt.Sprintf("%s resolved to these IP addresses:%s", u.Hostname(), hostAddrMessage))
-		}
 
-		res.checks = append(res.checks, check)
+			check.Details = append(check.Details, fmt.Sprintf("Request went to %s", httpReq.RemoteAddr))
+			// TODO: In theory we should be able to read the source IP address from the response's TCP packets, but golang's HTTP client doesn't want to let us >:(
+			// (I realize it could be spoofed or whatever, but the goal is to help people find problems, ok?)
+
+			if len(hostAddrs) > 0 {
+				var hostAddrMessage string
+				for _, addr := range hostAddrs {
+					hostAddrMessage += fmt.Sprintf("\n     - %s", addr)
+				}
+				check.Details = append(check.Details, fmt.Sprintf("%s resolved to these IP addresses:%s", u.Hostname(), hostAddrMessage))
+			}
+
+			res.checks = append(res.checks, check)
+		}
 	}
 
 	return res
