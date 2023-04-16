@@ -473,7 +473,7 @@ func runChecks(u *url.URL) Report {
 			fmt.Printf("PROBLEM: Got 502 Bad Gateway response.\n")
 			res.checks = append(res.checks, Check{
 				Status:  CheckWarn,
-				Message: "HTTP requests / responses are working, but got 503 Bad Gateway response",
+				Message: "HTTP requests / responses are working, but got 502 Bad Gateway response",
 			})
 		} else {
 			res.checks = append(res.checks, Check{

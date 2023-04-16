@@ -34,8 +34,8 @@ Make sure `$(go env GOPATH)/bin` is on your `PATH`.
 ## Running
 
 ```
-sudo yno localhost:8080
-sudo yno mywebsite.com
+yno localhost:8080
+yno mywebsite.com
 ```
 
 Because `yno` needs to trace packets, it must be run as root.
