@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"net"
@@ -209,12 +210,12 @@ func runChecks(u *url.URL) Checks {
 		u.Host = net.JoinHostPort(u.Host, "80")
 	}
 
-	listeners := checkListeningPorts(u.Port())
-	if len(listeners) == 0 {
-		fmt.Printf("ERROR: Nobody listening on port %s\n", u.Port())
-		res.anybodyListening = CheckFail
-	}
-	res.listeners = listeners
+	// listeners := checkListeningPorts(u.Port())
+	// if len(listeners) == 0 {
+	// 	fmt.Printf("ERROR: Nobody listening on port %s\n", u.Port())
+	// 	res.anybodyListening = CheckFail
+	// }
+	// res.listeners = listeners
 
 	fmt.Printf("Getting a TCP connection to %s...\n", u.Host)
 	conn, err := net.Dial("tcp", u.Host)
@@ -227,6 +228,17 @@ func runChecks(u *url.URL) Checks {
 
 	fmt.Println("Got a TCP connection.")
 	res.tcpWorks = CheckSuccess
+
+	var tokenBytes [16]byte
+	rand.Read(tokenBytes[:])
+	for i, b := range tokenBytes {
+		const alphabet = "bcdfghjklmnpqrstvwxyzBCDFGHJKLMNPQRSTVWXYZ0123456789"
+		tokenBytes[i] = alphabet[int(b)%len(alphabet)]
+	}
+	token := string(tokenBytes[:])
+
+	fmt.Printf("Sending HTTP request with token %s...\n", token)
+	conn.Write([]byte(fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: ynoserver\r\nAccept: */*\r\nX-ynoserver: %s\r\n\r\n", u.Host, token)))
 
 	return res
 }
